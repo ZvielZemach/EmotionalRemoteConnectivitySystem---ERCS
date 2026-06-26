@@ -27,6 +27,7 @@ dependencies:
   cloud_functions: ^5.4.0
   intl: ^0.20.2
   flutter_image_compress: ^2.1.0
+  firebase_auth: ^5.7.0
   # mime: ^1.0.4
   # path: ^1.8.3
   # http_parser: ^4.0.2
