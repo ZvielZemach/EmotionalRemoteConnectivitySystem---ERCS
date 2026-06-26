@@ -311,17 +311,19 @@
 //   }
 // }
 
-import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:http/http.dart' as http;
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_auth/firebase_auth.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:youtube_explode_dart/youtube_explode_dart.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart';
+import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart';
 
 // מחלקת צבעי ה-Theme המשותפת לפרויקט הגמר שלך
 class _ThemeColors {
@@ -507,10 +509,49 @@ class _SendSongState extends State<SendSong> {
         (uri.host.contains('youtube.com') || uri.host.contains('youtu.be'));
   }
 
+  /// ממיר כותרת שיר לשם קובץ באנגלית בלבד.
+  /// כל תו שאינו אות אנגלית או ספרה (כולל אותיות בעברית וסימנים) מוסר,
+  /// והרווחים מוחלפים בקו תחתון. אם לא נשאר דבר -> שם ברירת מחדל.
+  String _sanitizeToEnglish(String title) {
+    var name =
+        title
+            .replaceAll(RegExp(r'[^A-Za-z0-9 ]'), ' ') // הסרת עברית/סימנים
+            .replaceAll(RegExp(r'\s+'), ' ') // איחוד רווחים
+            .trim();
+    if (name.isEmpty) {
+      name = 'song_${DateTime.now().millisecondsSinceEpoch}';
+    }
+    name = name.replaceAll(' ', '_');
+    if (name.length > 60) name = name.substring(0, 60);
+    return name;
+  }
+
+  /// בונה נתיב MP3 ייחודי בתיקייה הנתונה כדי לא לדרוס קבצים קיימים.
+  String _uniqueMp3Path(Directory dir, String baseName) {
+    var candidate = '${dir.path}/$baseName.mp3';
+    var counter = 1;
+    while (File(candidate).existsSync()) {
+      candidate = '${dir.path}/${baseName}_$counter.mp3';
+      counter++;
+    }
+    return candidate;
+  }
+
+  /// מוריד את אודיו השיר ישירות מיוטיוב וממיר אותו ל-MP3 בתוך תיקיית my_songs.
   Future<void> _saveYouTubeSong() async {
     final url = youtubeController.text.trim();
     if (!_isValidYouTubeUrl(url)) {
       _showCustomSnackBar("קישור יוטיוב לא תקין", isError: true);
+      return;
+    }
+
+    // ודא שהקישור הוא לשיר בודד ולא לפלייליסט/מיקס (אין בו מזהה וידאו)
+    final videoId = VideoId.parseVideoId(url);
+    if (videoId == null) {
+      _showCustomSnackBar(
+        "זהו קישור לפלייליסט/מיקס ולא לשיר בודד. פתחו את השיר עצמו, לחצו 'שיתוף' והעתיקו את הקישור (קישור תקין מכיל \"watch?v=\" או הוא מסוג youtu.be).",
+        isError: true,
+      );
       return;
     }
 
@@ -522,26 +563,91 @@ class _SendSongState extends State<SendSong> {
       return;
     }
 
+    // הרשאת גישה לאחסון נדרשת כדי לכתוב לתיקיית my_songs
+    if (Platform.isAndroid &&
+        !await Permission.manageExternalStorage.request().isGranted) {
+      _showCustomSnackBar(
+        "נדרשת הרשאת גישה לאחסון כדי לשמור שירים",
+        isError: true,
+      );
+      return;
+    }
+
     setState(() => isDownloading = true);
 
+    final yt = YoutubeExplode();
+    File? tempAudio;
     try {
-      final response = await http.post(
-        Uri.parse("http://5.102.238.242:3000/download-youtube"),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({"youtubeUrl": url}),
+      // 1. שליפת מידע על הסרטון ובניית שם קובץ באנגלית מתוך הכותרת
+      final video = await yt.videos.get(videoId);
+      final baseName = _sanitizeToEnglish(video.title);
+
+      // 2. שליפת ה-manifest עם מספר לקוחות (clients) של יוטיוב.
+      // הלקוחות ios/androidVr/tv בדרך כלל מחזירים קישורים ישירים שאינם
+      // דורשים פענוח חתימה, ולכן אמינים יותר כשהחילוץ נכשל.
+      final manifest = await yt.videos.streamsClient.getManifest(
+        video.id,
+        ytClients: [
+          YoutubeApiClient.ios,
+          YoutubeApiClient.androidVr,
+          YoutubeApiClient.tv,
+        ],
       );
-      if (response.statusCode == 200) {
-        await _loadDownloadedSongs();
-        youtubeController.clear();
-        _showCustomSnackBar("השיר הורד ונשמר בהצלחה 🎵", isError: false);
+
+      // בחירת ערוץ האודיו האיכותי ביותר. אם אין ערוץ אודיו-בלבד,
+      // ניפול חזרה לערוץ משולב (אודיו+וידאו) ו-FFmpeg יסיר את הווידאו.
+      final StreamInfo source;
+      if (manifest.audioOnly.isNotEmpty) {
+        source = manifest.audioOnly.withHighestBitrate();
+      } else if (manifest.muxed.isNotEmpty) {
+        source = manifest.muxed.withHighestBitrate();
       } else {
-        _showCustomSnackBar("שגיאה בהורדה משרת ה-Proxy", isError: true);
+        throw Exception("לא נמצאו ערוצי אודיו זמינים לשיר הזה");
       }
+      final audio = source;
+      final audioStream = yt.videos.streamsClient.get(audio);
+
+      // 3. הורדת האודיו לקובץ זמני
+      final tmpDir = await getTemporaryDirectory();
+      tempAudio = File(
+        '${tmpDir.path}/yt_${DateTime.now().millisecondsSinceEpoch}.${audio.container.name}',
+      );
+      final sink = tempAudio.openWrite();
+      await for (final chunk in audioStream) {
+        sink.add(chunk);
+      }
+      await sink.flush();
+      await sink.close();
+
+      // 4. נתיב היעד ל-MP3 בתיקיית my_songs (ייחודי)
+      final dir = await _getAudioDirectory();
+      final outPath = _uniqueMp3Path(dir, baseName);
+
+      // 5. המרה ל-MP3 באמצעות FFmpeg (libmp3lame, איכות VBR ~190kbps)
+      final session = await FFmpegKit.execute(
+        '-y -i "${tempAudio.path}" -vn -acodec libmp3lame -q:a 2 "$outPath"',
+      );
+      final returnCode = await session.getReturnCode();
+      if (!ReturnCode.isSuccess(returnCode)) {
+        final logs = await session.getAllLogsAsString();
+        print("FFmpeg conversion failed: $logs");
+        throw Exception("conversion failed");
+      }
+
+      await _loadDownloadedSongs();
+      youtubeController.clear();
+      _showCustomSnackBar("השיר הורד והומר ל-MP3 בהצלחה 🎵", isError: false);
     } catch (e) {
       print("Download error: $e");
-      _showCustomSnackBar("הורדה נכשלה, נסה שוב מאוחר יותר", isError: true);
+      _showCustomSnackBar("הורדה נכשלה: $e", isError: true);
     } finally {
-      setState(() => isDownloading = false);
+      yt.close();
+      if (tempAudio != null && await tempAudio.exists()) {
+        try {
+          await tempAudio.delete();
+        } catch (_) {}
+      }
+      if (mounted) setState(() => isDownloading = false);
     }
   }
 
@@ -595,6 +701,8 @@ class _SendSongState extends State<SendSong> {
       SnackBar(
         behavior: SnackBarBehavior.floating,
         backgroundColor: isError ? Colors.redAccent : Colors.green,
+        // משך ארוך יותר לשגיאות כדי שניתן יהיה לקרוא את הפירוט
+        duration: Duration(seconds: isError ? 10 : 3),
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         content: Row(
           children: [
@@ -813,7 +921,7 @@ class _SendSongState extends State<SendSong> {
 
                       ElevatedButton.icon(
                         icon: const Icon(Icons.folder_open_outlined),
-                        label: const Text("בחר שיר מתיקיית my_songs"),
+                        label: const Text("choose song from my_songs folder"),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.white,
                           foregroundColor: _ThemeColors.primary,
@@ -828,7 +936,9 @@ class _SendSongState extends State<SendSong> {
                       const SizedBox(height: 8),
                       ElevatedButton.icon(
                         icon: const Icon(Icons.phone_android_outlined),
-                        label: const Text("בחר שיר מהגלריה הכללית"),
+                        label: const Text(
+                          "choose song from the general gallery",
+                        ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.white,
                           foregroundColor: _ThemeColors.primary,
@@ -855,7 +965,9 @@ class _SendSongState extends State<SendSong> {
                                 )
                                 : const Icon(Icons.send_rounded),
                         label: Text(
-                          isSending ? "מעלה לשרת..." : "שלח שיר ל-Firebase",
+                          isSending
+                              ? "upload to server..."
+                              : "send dong to - Firebase",
                         ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: _ThemeColors.primary,
@@ -923,7 +1035,7 @@ class _SendSongState extends State<SendSong> {
                               color: Colors.redAccent,
                             ),
                             label: const Text(
-                              "פתח אפליקציה",
+                              "open app",
                               style: TextStyle(
                                 fontSize: 12,
                                 color: Colors.redAccent,
@@ -938,7 +1050,7 @@ class _SendSongState extends State<SendSong> {
                       TextField(
                         controller: youtubeController,
                         decoration: InputDecoration(
-                          labelText: "הדבק כאן קישור לשיר ביוטיוב",
+                          labelText: "paste here the link from",
                           labelStyle: TextStyle(
                             color: Colors.grey[600],
                             fontSize: 14,
@@ -976,8 +1088,8 @@ class _SendSongState extends State<SendSong> {
                                 : const Icon(Icons.download_rounded),
                         label: Text(
                           isDownloading
-                              ? "מוריד וממיר ל-MP3..."
-                              : "הורד ושמור שיר מהיוטיוב",
+                              ? " downloading & converting to - MP3..."
+                              : "download & keep song from YouTube",
                         ),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.redAccent,
@@ -1006,7 +1118,7 @@ class _SendSongState extends State<SendSong> {
                   SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      "שירים שמורים במכשיר",
+                      "Device's songs:",
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
                         fontSize: 16,
@@ -1026,476 +1138,3 @@ class _SendSongState extends State<SendSong> {
     );
   }
 }
-
-// import 'dart:convert';
-// import 'dart:io';
-// import 'package:flutter/material.dart';
-// import 'package:file_picker/file_picker.dart';
-// import 'package:permission_handler/permission_handler.dart';
-// import 'package:path_provider/path_provider.dart';
-// import 'package:url_launcher/url_launcher.dart';
-// import 'package:just_audio/just_audio.dart';
-// import 'package:http/http.dart' as http;
-// import 'package:firebase_storage/firebase_storage.dart';
-// import 'package:firebase_database/firebase_database.dart';
-// import 'package:firebase_auth/firebase_auth.dart';
-
-// class SendSong extends StatefulWidget {
-//   const SendSong({super.key});
-
-//   @override
-//   State<SendSong> createState() => _SendSongState();
-// }
-
-// class _SendSongState extends State<SendSong> {
-//   String? selectedFilePath;
-//   String? selectedFileName;
-//   bool isSending = false;
-//   bool isDownloading = false; // חיווי ויזואלי להורדה מהיוטיוב
-//   TextEditingController youtubeController = TextEditingController();
-//   List<File> downloadedSongs = [];
-//   late AudioPlayer _audioPlayer;
-//   File? currentlyPlayingFile;
-
-//   @override
-//   void initState() {
-//     super.initState();
-//     _audioPlayer = AudioPlayer();
-//     _loadDownloadedSongs();
-//   }
-
-//   @override
-//   void dispose() {
-//     _audioPlayer.dispose();
-//     youtubeController.dispose();
-//     super.dispose();
-//   }
-
-//   /// קבלת נתיב תיקייה חוקי ומאובטח באנדרואיד (בתוך מסמכי האפליקציה)
-//   Future<Directory> _getAudioDirectory() async {
-//     final baseDir = await getApplicationDocumentsDirectory();
-//     final dir = Directory("${baseDir.path}/my_songs");
-//     if (!await dir.exists()) {
-//       await dir.create(recursive: true);
-//     }
-//     return dir;
-//   }
-
-//   /// טעינת השירים הקיימים מהתיקייה המקומית
-//   Future<void> _loadDownloadedSongs() async {
-//     try {
-//       final dir = await _getAudioDirectory();
-//       final files =
-//           dir
-//               .listSync()
-//               .whereType<File>()
-//               .where((f) => f.path.endsWith('.mp3'))
-//               .toList();
-//       setState(() => downloadedSongs = files);
-//     } catch (e) {
-//       print("Error loading songs: $e");
-//     }
-//   }
-
-//   /// בחירת שיר מתוך רשימת השירים שהורדו מיוטיוב
-//   Future<void> _pickMusicFromFolder() async {
-//     if (downloadedSongs.isEmpty) {
-//       _showMessage("אין שירים זמינים בתיקיית my_songs");
-//       return;
-//     }
-//     showModalBottomSheet(
-//       context: context,
-//       shape: const RoundedRectangleBorder(
-//         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
-//       ),
-//       builder:
-//           (_) => Container(
-//             padding: const EdgeInsets.all(16),
-//             child: Column(
-//               mainAxisSize: MainAxisSize.min,
-//               children: [
-//                 const Text(
-//                   "בחר שיר מתיקיית ההורדות",
-//                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-//                 ),
-//                 const Divider(),
-//                 Expanded(
-//                   child: ListView.builder(
-//                     itemCount: downloadedSongs.length,
-//                     itemBuilder: (_, index) {
-//                       final file = downloadedSongs[index];
-//                       final name = file.path.split('/').last;
-//                       return ListTile(
-//                         leading: const Icon(
-//                           Icons.music_note,
-//                           color: Colors.blue,
-//                         ),
-//                         title: Text(name),
-//                         onTap: () {
-//                           setState(() {
-//                             selectedFilePath = file.path;
-//                             selectedFileName = name;
-//                           });
-//                           Navigator.pop(context);
-//                         },
-//                       );
-//                     },
-//                   ),
-//                 ),
-//               ],
-//             ),
-//           ),
-//     );
-//   }
-
-//   /// בחירת קובץ מכל מקום אחר במכשיר
-//   Future<void> _pickMusicFromDevice() async {
-//     final result = await FilePicker.platform.pickFiles(type: FileType.audio);
-//     if (result?.files.single.path != null) {
-//       setState(() {
-//         selectedFilePath = result!.files.single.path!;
-//         selectedFileName = result.files.single.name;
-//       });
-//     }
-//   }
-
-//   /// העלאת השיר הנבחר ל-Firebase והודעה ל-ESP32
-//   Future<void> _sendSongToFirebase() async {
-//     if (selectedFilePath == null) return;
-
-//     if (FirebaseAuth.instance.currentUser == null) {
-//       _showMessage("שגיאת אבטחה: עליך להיות מחובר כדי להעלות שירים");
-//       return;
-//     }
-
-//     setState(() => isSending = true);
-
-//     final song = File(selectedFilePath!);
-//     final size = await song.length();
-
-//     if (size > 15 * 1024 * 1024) {
-//       // הגדלה קלה ל-15MB ליתר ביטחון עבור שירים ארוכים
-//       _showMessage("קובץ גדול מדי, לא ניתן להעלות");
-//       setState(() => isSending = false);
-//       return;
-//     }
-
-//     final fileName = selectedFileName ?? song.path.split('/').last;
-//     final ref = FirebaseStorage.instance.ref("songs/$fileName");
-
-//     try {
-//       _showMessage("מעלה קובץ לשרת, אנא המתן...");
-//       await ref.putFile(song);
-
-//       final downloadUrl = await ref.getDownloadURL();
-//       await FirebaseDatabase.instance.ref("esp32/audio_url").set(downloadUrl);
-
-//       _showMessage("השיר עלה בהצלחה ונשלח ל-ESP32! 🎉");
-//       setState(() {
-//         selectedFilePath = null;
-//         selectedFileName = null;
-//       });
-//     } catch (e) {
-//       print("Upload error: $e");
-//       _showMessage("נכשלה העלאת השיר: בדוק חיבור לרשת או הרשאות שרת");
-//     } finally {
-//       setState(() => isSending = false);
-//     }
-//   }
-
-//   bool _isValidYouTubeUrl(String url) {
-//     final uri = Uri.tryParse(url);
-//     return uri != null &&
-//         uri.hasAbsolutePath &&
-//         (uri.host.contains('youtube.com') || uri.host.contains('youtu.be'));
-//   }
-
-//   /// הורדת השיר משרת ה-Proxy ושמירתו הפיזית במכשיר
-//   Future<void> _saveYouTubeSong() async {
-//     final url = youtubeController.text.trim();
-//     if (!_isValidYouTubeUrl(url)) {
-//       _showMessage("קישור יוטיוב לא תקין");
-//       return;
-//     }
-
-//     if (FirebaseAuth.instance.currentUser == null) {
-//       _showMessage("פעולה נדחתה: משתמשים לא רשומים אינם רשאים להוריד שירים");
-//       return;
-//     }
-
-//     setState(() => isDownloading = true);
-//     _showMessage("השרת מעבד ומוריד את השיר מיוטיוב, אנא המתן...");
-
-//     try {
-//       final response = await http
-//           .post(
-//             Uri.parse("http://5.102.238.242:3000/download-youtube"),
-//             headers: {'Content-Type': 'application/json'},
-//             body: jsonEncode({"youtubeUrl": url}),
-//           )
-//           .timeout(
-//             const Duration(minutes: 2),
-//           ); // הוספת Timeout כי המרה לוקחת זמן
-
-//       if (response.statusCode == 200) {
-//         final dir = await _getAudioDirectory();
-
-//         // יצירת שם קובץ ייחודי מבוסס זמן הנוכחי כדי שלא יידרסו קבצים
-//         final timestamp = DateTime.now().millisecondsSinceEpoch;
-//         final fileSavePath = "${dir.path}/youtube_$timestamp.mp3";
-
-//         final file = File(fileSavePath);
-
-//         // שמירת ה-Bytes שחזרו מהשרת ישירות לתוך קובץ ה-MP3 במכשיר החכם!
-//         await file.writeAsBytes(response.bodyBytes);
-
-//         await _loadDownloadedSongs();
-//         youtubeController.clear();
-//         _showMessage("🎵 השיר הורד ונשמר בהצלחה בתיקיית האפליקציה!");
-//       } else {
-//         _showMessage("שגיאה בקוד השרת המרוחק (${response.statusCode})");
-//       }
-//     } catch (e) {
-//       print("Download error: $e");
-//       _showMessage("ההורדה נכשלה. ודא שהשרת המרוחק שלך דלוק ומגיב.");
-//     } finally {
-//       setState(() => isDownloading = false);
-//     }
-//   }
-
-//   void _openYouTube() async {
-//     final url = Uri.parse("https://www.youtube.com/");
-//     if (await canLaunchUrl(url)) {
-//       await launchUrl(url, mode: LaunchMode.externalApplication);
-//     } else {
-//       _showMessage("לא ניתן לפתוח את YouTube");
-//     }
-//   }
-
-//   Future<void> _playOrStopSong(File song) async {
-//     if (currentlyPlayingFile == song) {
-//       await _audioPlayer.stop();
-//       setState(() => currentlyPlayingFile = null);
-//     } else {
-//       try {
-//         await _audioPlayer.setFilePath(song.path);
-//         await _audioPlayer.play();
-//         setState(() => currentlyPlayingFile = song);
-//       } catch (e) {
-//         _showMessage("שגיאה בניגון הקובץ");
-//       }
-//     }
-//   }
-
-//   Future<void> _deleteSong(File song) async {
-//     try {
-//       if (currentlyPlayingFile == song) {
-//         await _audioPlayer.stop();
-//         currentlyPlayingFile = null;
-//       }
-//       await song.delete();
-//       await _loadDownloadedSongs();
-//       _showMessage("השיר נמחק");
-//     } catch (e) {
-//       print("Delete error: $e");
-//     }
-//   }
-
-//   void _showMessage(String message) {
-//     if (!mounted) return;
-//     ScaffoldMessenger.of(context).showSnackBar(
-//       SnackBar(content: Text(message), duration: const Duration(seconds: 3)),
-//     );
-//   }
-
-//   Widget _buildSongList() {
-//     if (downloadedSongs.isEmpty) {
-//       return const Center(
-//         child: Padding(
-//           padding: EdgeInsets.all(8.0),
-//           child: Text("אין שירים בתיקייה, הדבק קישור למעלה כדי להוריד"),
-//         ),
-//       );
-//     }
-//     return ListView.builder(
-//       shrinkWrap: true,
-//       physics: const NeverScrollableScrollPhysics(),
-//       itemCount: downloadedSongs.length,
-//       itemBuilder: (_, index) {
-//         final song = downloadedSongs[index];
-//         final isPlaying = currentlyPlayingFile == song;
-//         final name = song.path.split('/').last;
-//         return Card(
-//           elevation: 2,
-//           margin: const EdgeInsets.symmetric(vertical: 4),
-//           child: ListTile(
-//             leading: Icon(
-//               isPlaying ? Icons.music_video : Icons.music_note,
-//               color: isPlaying ? Colors.green : Colors.grey,
-//             ),
-//             title: Text(name, maxLines: 1, overflow: TextOverflow.ellipsis),
-//             trailing: Row(
-//               mainAxisSize: MainAxisSize.min,
-//               children: [
-//                 IconButton(
-//                   icon: Icon(isPlaying ? Icons.stop : Icons.play_arrow),
-//                   color: isPlaying ? Colors.red : Colors.blue,
-//                   onPressed: () => _playOrStopSong(song),
-//                 ),
-//                 IconButton(
-//                   icon: const Icon(Icons.delete, color: Colors.redAccent),
-//                   onPressed: () => _deleteSong(song),
-//                 ),
-//               ],
-//             ),
-//           ),
-//         );
-//       },
-//     );
-//   }
-
-//   @override
-//   Widget build(BuildContext context) {
-//     return Scaffold(
-//       appBar: AppBar(
-//         title: const Text("שליחת שיר ל-Firebase"),
-//         centerTitle: true,
-//       ),
-//       body: SingleChildScrollView(
-//         padding: const EdgeInsets.all(16),
-//         child: Column(
-//           crossAxisAlignment: CrossAxisAlignment.stretch,
-//           children: [
-//             // תצוגת השיר שנבחר כרגע לעלייה
-//             Container(
-//               padding: const EdgeInsets.all(12),
-//               decoration: BoxDecoration(
-//                 color: Colors.grey[200],
-//                 borderRadius: BorderRadius.circular(10),
-//               ),
-//               child: AnimatedSwitcher(
-//                 duration: const Duration(milliseconds: 300),
-//                 child:
-//                     selectedFileName == null
-//                         ? const Text("• לא נבחר שיר להעלאה")
-//                         : Text(
-//                           "• שיר מוכן למשלוח: $selectedFileName",
-//                           key: ValueKey(selectedFileName),
-//                           style: const TextStyle(
-//                             fontWeight: FontWeight.bold,
-//                             color: Colors.blue,
-//                           ),
-//                         ),
-//               ),
-//             ),
-//             const SizedBox(height: 15),
-
-//             ElevatedButton.icon(
-//               icon: const Icon(Icons.folder_special),
-//               onPressed: _pickMusicFromFolder,
-//               label: const Text("בחר מתוך השירים שהורדו מיוטיוב"),
-//             ),
-//             ElevatedButton.icon(
-//               icon: const Icon(Icons.audiotrack),
-//               onPressed: _pickMusicFromDevice,
-//               label: const Text("בחר שיר אחר מהגלריה הכללית"),
-//             ),
-
-//             const SizedBox(height: 10),
-//             ElevatedButton(
-//               style: ElevatedButton.styleFrom(
-//                 backgroundColor: Colors.green[600],
-//               ),
-//               onPressed:
-//                   (selectedFilePath == null || isSending)
-//                       ? null
-//                       : _sendSongToFirebase,
-//               child:
-//                   isSending
-//                       ? const SizedBox(
-//                         height: 20,
-//                         width: 20,
-//                         child: CircularProgressIndicator(
-//                           color: Colors.white,
-//                           strokeWidth: 2,
-//                         ),
-//                       )
-//                       : const Text(
-//                         "שלח שיר נבחר ל-Firebase",
-//                         style: TextStyle(color: Colors.white),
-//                       ),
-//             ),
-
-//             const Divider(height: 40, thickness: 1.5),
-
-//             ElevatedButton.icon(
-//               style: ElevatedButton.styleFrom(backgroundColor: Colors.red[700]),
-//               icon: const Icon(Icons.open_in_new, color: Colors.white),
-//               onPressed: _openYouTube,
-//               label: const Text(
-//                 "פתח אפליקציית YouTube להעתקת קישור",
-//                 style: TextStyle(color: Colors.white),
-//               ),
-//             ),
-//             const SizedBox(height: 15),
-
-//             TextField(
-//               controller: youtubeController,
-//               decoration: const InputDecoration(
-//                 labelText: "הדבק כאן קישור לשיר ביוטיוב",
-//                 prefixIcon: Icon(Icons.link, color: Colors.red),
-//                 border: OutlineInputBorder(),
-//               ),
-//             ),
-//             const SizedBox(height: 10),
-
-//             ElevatedButton(
-//               style: ElevatedButton.styleFrom(
-//                 backgroundColor: Colors.redAccent,
-//               ),
-//               onPressed: isDownloading ? null : _saveYouTubeSong,
-//               child:
-//                   isDownloading
-//                       ? const Row(
-//                         mainAxisAlignment: MainAxisAlignment.center,
-//                         children: [
-//                           SizedBox(
-//                             height: 18,
-//                             width: 18,
-//                             child: CircularProgressIndicator(
-//                               color: Colors.white,
-//                               strokeWidth: 2,
-//                             ),
-//                           ),
-//                           SizedBox(width: 10),
-//                           Text(
-//                             "מבצע הורדה מהשרת המרוחק...",
-//                             style: TextStyle(color: Colors.white),
-//                           ),
-//                         ],
-//                       )
-//                       : const Text(
-//                         "הורד ושמור שיר מהיוטיוב",
-//                         style: TextStyle(color: Colors.white),
-//                       ),
-//             ),
-
-//             const Divider(height: 40, thickness: 1.5),
-//             const Row(
-//               children: [
-//                 Icon(Icons.download_done, color: Colors.green),
-//                 SizedBox(width: 8),
-//                 Text(
-//                   "שירים מקומיים באפליקציה (my_songs)",
-//                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-//                 ),
-//               ],
-//             ),
-//             const SizedBox(height: 10),
-//             _buildSongList(),
-//           ],
-//         ),
-//       ),
-//     );
-//   }
-// }

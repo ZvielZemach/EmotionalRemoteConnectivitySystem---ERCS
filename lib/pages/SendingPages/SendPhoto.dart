@@ -1,4 +1,6 @@
 import 'dart:io';
+import 'dart:math' as math;
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path/path.dart' as path;
@@ -7,9 +9,52 @@ import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:image_gallery_saver_plus/image_gallery_saver_plus.dart';
-import 'dart:typed_data';
-import 'package:flutter_image_compress/flutter_image_compress.dart';
+import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
+
+// מידות מסך ה-TFT של ה-ESP32
+const int _tftWidth = 480;
+const int _tftHeight = 320;
+
+/// משנה את גודל התמונה לבדיוק 480x320 (גודל מסך ה-TFT).
+/// התמונה ממולאת כך שתכסה את כל המסגרת תוך שמירה על יחס הממדים (cover),
+/// והעודף נחתך מהמרכז כך שאין שוליים שחורים כלל.
+/// פונקציה זו ברמת המודול כדי שניתן יהיה להריץ אותה ב-isolate נפרד עם compute().
+Uint8List _resizeImageForTft(Uint8List bytes) {
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) {
+    throw Exception('Could not decode the selected image');
+  }
+
+  // החלת כיוון ה-EXIF כך שתמונות מסובבות יישמרו בכיוון הנכון
+  final oriented = img.bakeOrientation(decoded);
+
+  // קנה מידה כך שהתמונה תכסה את כל 480x320 תוך שמירה על יחס הממדים (cover)
+  final scale = math.max(
+    _tftWidth / oriented.width,
+    _tftHeight / oriented.height,
+  );
+  final newWidth = (oriented.width * scale).round();
+  final newHeight = (oriented.height * scale).round();
+
+  final resized = img.copyResize(
+    oriented,
+    width: newWidth,
+    height: newHeight,
+    interpolation: img.Interpolation.average,
+  );
+
+  // חיתוך העודף מהמרכז כדי לקבל בדיוק 480x320 ללא שוליים
+  final cropped = img.copyCrop(
+    resized,
+    x: ((newWidth - _tftWidth) / 2).round(),
+    y: ((newHeight - _tftHeight) / 2).round(),
+    width: _tftWidth,
+    height: _tftHeight,
+  );
+
+  return img.encodeJpg(cropped, quality: 90);
+}
 
 class Sendphoto extends StatefulWidget {
   const Sendphoto({super.key});
@@ -133,37 +178,31 @@ class _SendphotoState extends State<Sendphoto> {
     setState(() => _isUploading = true);
 
     try {
-      // יצירת קובץ זמני לדחיסה
+      // קריאת התמונה המקורית ושינוי גודלה לבדיוק 480x320 (גודל מסך ה-TFT).
+      // ההמרה רצה ב-isolate נפרד דרך compute() כדי לא לתקוע את ה-UI.
+      final originalBytes = await _selectedImage!.readAsBytes();
+      final resizedBytes = await compute(_resizeImageForTft, originalBytes);
+
+      // כתיבת התמונה המעובדת לקובץ זמני לצורך ההעלאה
       final dir = await getTemporaryDirectory();
       final compressedPath = path.join(
         dir.path,
-        "compressed_${DateTime.now().millisecondsSinceEpoch}.jpg",
+        "tft_${DateTime.now().millisecondsSinceEpoch}.jpg",
       );
+      final compressedFile = File(compressedPath);
+      await compressedFile.writeAsBytes(resizedBytes);
 
-      // דחיסה ושינוי גודל תואם למסך ה-TFT של ה-ESP32
-      final compressedFile = await FlutterImageCompress.compressAndGetFile(
-        _selectedImage!.path,
-        compressedPath,
-        quality: 100,
-        minWidth: 480,
-        minHeight: 320,
-        format: CompressFormat.jpeg,
-        keepExif: false,
+      final fileSizeKB = resizedBytes.length / 1024;
+      print(
+        "✅ Resized to ${_tftWidth}x$_tftHeight, size: ${fileSizeKB.toStringAsFixed(2)} KB",
       );
-
-      if (compressedFile == null) {
-        throw Exception("Compression failed");
-      }
-
-      final fileSizeKB = await compressedFile.length() / 1024;
-      print("✅ Compressed size: ${fileSizeKB.toStringAsFixed(2)} KB");
 
       // העלאה ל־Firebase Storage
       final fileName = path.basename(compressedFile.path);
       final storageRef = FirebaseStorage.instance.ref().child(
         "images/$fileName",
       );
-      final uploadTask = await storageRef.putFile(File(compressedFile.path));
+      final uploadTask = await storageRef.putFile(compressedFile);
       final downloadUrl = await uploadTask.ref.getDownloadURL();
 
       final timestamp = DateTime.now().toIso8601String();

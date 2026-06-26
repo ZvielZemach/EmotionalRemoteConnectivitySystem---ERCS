@@ -67,7 +67,7 @@ class _SendMessageState extends State<SendMessage> {
               Icon(Icons.check_circle_outline, color: Colors.white),
               SizedBox(width: 10),
               Expanded(
-                child: Text("The message succesfuly sent to - ESP32 🎉"),
+                child: Text("The message succesfuly sent to - my love 🎉"),
               ),
             ],
           ),
@@ -166,7 +166,7 @@ class _SendMessageState extends State<SendMessage> {
                     keyboardType: TextInputType.multiline,
                     style: const TextStyle(fontSize: 16),
                     decoration: InputDecoration(
-                      hintText: "Write here your message...",
+                      hintText: "Write here your message in English...",
                       alignLabelWithHint: true,
                       prefixIcon: const Padding(
                         padding: EdgeInsets.only(bottom: 40),
