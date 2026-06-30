@@ -51,9 +51,7 @@ class _SelectionPageState extends State<Selectionpage> {
         decoration: BoxDecoration(
           image: DecorationImage(
             image: AssetImage(
-              isHadarUser
-                  ? "assets/Zviel.jpeg"
-                  : "assets/Hadar_Funney_Face.jpeg",
+              isHadarUser ? "assets/me.jpg" : "assets/my_beautiful_wife.jpg",
             ),
             fit: BoxFit.cover,
           ),
@@ -72,7 +70,8 @@ class _SelectionPageState extends State<Selectionpage> {
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(28),
                         child: BackdropFilter(
-                          filter: ImageFilter.blur(sigmaX: 8, sigmaY: 8),
+                          // טשטוש מינימלי כך שהריבוע כמעט שקוף לחלוטין והתמונה ברקע נראית
+                          filter: ImageFilter.blur(sigmaX: 1.5, sigmaY: 1.5),
                           child: Container(
                             width:
                                 constraints.maxWidth > 600
@@ -80,7 +79,7 @@ class _SelectionPageState extends State<Selectionpage> {
                                     : double.infinity,
                             padding: const EdgeInsets.all(24),
                             decoration: BoxDecoration(
-                              color: Colors.white.withOpacity(0.15),
+                              color: Colors.white.withOpacity(0.05),
                               borderRadius: BorderRadius.circular(28),
                               border: Border.all(
                                 color: Colors.white.withOpacity(0.25),

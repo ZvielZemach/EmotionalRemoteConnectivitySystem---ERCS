@@ -353,6 +353,12 @@ class _SendSongState extends State<SendSong> {
   void initState() {
     super.initState();
     _audioPlayer = AudioPlayer();
+    // מאזין יחיד למצב הנגן: כשהשיר מסתיים מעצמו, מאפסים את האייקון לכפתור Play.
+    _audioPlayer.playerStateStream.listen((state) {
+      if (state.processingState == ProcessingState.completed) {
+        if (mounted) setState(() => currentlyPlayingFile = null);
+      }
+    });
     _loadDownloadedSongs();
   }
 
@@ -386,7 +392,7 @@ class _SendSongState extends State<SendSong> {
 
   Future<void> _pickMusicFromFolder() async {
     if (downloadedSongs.isEmpty) {
-      _showCustomSnackBar("אין שירים זמינים בתיקייה", isError: true);
+      _showCustomSnackBar("No valid songs in the folder", isError: true);
       return;
     }
     showModalBottomSheet(
@@ -411,7 +417,7 @@ class _SendSongState extends State<SendSong> {
                 ),
                 const SizedBox(height: 15),
                 const Text(
-                  "בחר שיר מתיקיית האפליקציה",
+                  "choose song from the application folder",
                   style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
                 ),
                 const Divider(),
@@ -462,7 +468,7 @@ class _SendSongState extends State<SendSong> {
 
     if (FirebaseAuth.instance.currentUser == null) {
       _showCustomSnackBar(
-        "שגיאת אבטחה: עליך להיות מחובר כדי להעלות שירים",
+        "Security error: you need to be connected to send songs",
         isError: true,
       );
       return;
@@ -486,7 +492,10 @@ class _SendSongState extends State<SendSong> {
       final downloadUrl = await ref.getDownloadURL();
       await FirebaseDatabase.instance.ref("esp32/audio_url").set(downloadUrl);
 
-      _showCustomSnackBar("השיר עלה בהצלחה ונשלח ל-ESP32! 🎉", isError: false);
+      _showCustomSnackBar(
+        "The song uploaded and sent to-ESP32! 🎉",
+        isError: false,
+      );
       setState(() {
         selectedFilePath = null;
         selectedFileName = null;
@@ -494,7 +503,7 @@ class _SendSongState extends State<SendSong> {
     } catch (e) {
       print("Upload error: $e");
       _showCustomSnackBar(
-        "נכשלה העלאת השיר: חוסר בהרשאות אבטחה בשרת",
+        "faild to upload the song: mismuch in the security validation",
         isError: true,
       );
     } finally {
@@ -541,7 +550,7 @@ class _SendSongState extends State<SendSong> {
   Future<void> _saveYouTubeSong() async {
     final url = youtubeController.text.trim();
     if (!_isValidYouTubeUrl(url)) {
-      _showCustomSnackBar("קישור יוטיוב לא תקין", isError: true);
+      _showCustomSnackBar("YouTube link unvalid", isError: true);
       return;
     }
 
@@ -636,10 +645,13 @@ class _SendSongState extends State<SendSong> {
 
       await _loadDownloadedSongs();
       youtubeController.clear();
-      _showCustomSnackBar("השיר הורד והומר ל-MP3 בהצלחה 🎵", isError: false);
+      _showCustomSnackBar(
+        "The song downloaded and converted to -MP3 successfuly 🎵",
+        isError: false,
+      );
     } catch (e) {
       print("Download error: $e");
-      _showCustomSnackBar("הורדה נכשלה: $e", isError: true);
+      _showCustomSnackBar("Download faild: $e", isError: true);
     } finally {
       yt.close();
       if (tempAudio != null && await tempAudio.exists()) {
@@ -656,42 +668,46 @@ class _SendSongState extends State<SendSong> {
     if (await canLaunchUrl(url)) {
       await launchUrl(url, mode: LaunchMode.externalApplication);
     } else {
-      _showCustomSnackBar("לא ניתן לפתוח את YouTube", isError: true);
+      _showCustomSnackBar("cant open YouTube", isError: true);
     }
   }
 
   Future<void> _playOrStopSong(File song) async {
-    if (currentlyPlayingFile == song) {
-      await _audioPlayer.stop();
-      setState(() => currentlyPlayingFile = null);
-    } else {
-      await _audioPlayer.setFilePath(song.path);
-      await _audioPlayer.play();
-      setState(() => currentlyPlayingFile = song);
+    // השוואה לפי נתיב הקובץ (ולא לפי מופע ה-File) כדי שזה ימשיך לעבוד
+    // גם אחרי רענון הרשימה, שמייצר מופעי File חדשים.
+    final isSameSong = currentlyPlayingFile?.path == song.path;
 
-      // האזנה לסיום השיר באופן אוטומטי
-      _audioPlayer.playerStateStream.listen((state) {
-        if (state.processingState == ProcessingState.completed) {
-          if (mounted) {
-            setState(() => currentlyPlayingFile = null);
-          }
-        }
-      });
+    if (isSameSong) {
+      await _audioPlayer.stop();
+      if (mounted) setState(() => currentlyPlayingFile = null);
+      return;
+    }
+
+    try {
+      await _audioPlayer.setFilePath(song.path);
+      // מעדכנים את המצב מיד כדי שהאייקון יתחלף ל-Stop בלחיצה אחת.
+      if (mounted) setState(() => currentlyPlayingFile = song);
+      // לא ממתינים ל-play()! ב-just_audio ה-Future שלו מסתיים רק כשהשיר נגמר,
+      // ולכן await כאן היה דוחה את עדכון ה-UI עד סוף השיר (תקלת ה"לחיצה מאחור").
+      _audioPlayer.play();
+    } catch (e) {
+      print("Play error: $e");
+      if (mounted) setState(() => currentlyPlayingFile = null);
     }
   }
 
   Future<void> _deleteSong(File song) async {
     try {
-      if (currentlyPlayingFile == song) {
+      if (currentlyPlayingFile?.path == song.path) {
         await _audioPlayer.stop();
         currentlyPlayingFile = null;
       }
       await song.delete();
       await _loadDownloadedSongs();
-      _showCustomSnackBar("השיר נמחק מהמכשיר", isError: false);
+      _showCustomSnackBar("The song has been deketed", isError: false);
     } catch (e) {
       print("Delete error: $e");
-      _showCustomSnackBar("שגיאה במחיקת הקובץ", isError: true);
+      _showCustomSnackBar("Error in deleting file", isError: true);
     }
   }
 
@@ -733,7 +749,7 @@ class _SendSongState extends State<SendSong> {
         ),
         child: const Center(
           child: Text(
-            "אין שירים בתיקייה המקומית",
+            "No songs in the local folder",
             style: TextStyle(color: Colors.grey, fontWeight: FontWeight.w500),
           ),
         ),
@@ -745,7 +761,7 @@ class _SendSongState extends State<SendSong> {
       itemCount: downloadedSongs.length,
       itemBuilder: (_, index) {
         final song = downloadedSongs[index];
-        final isPlaying = currentlyPlayingFile == song;
+        final isPlaying = currentlyPlayingFile?.path == song.path;
         return Card(
           margin: const EdgeInsets.only(bottom: 8),
           elevation: 1,
@@ -803,7 +819,7 @@ class _SendSongState extends State<SendSong> {
       backgroundColor: _ThemeColors.background,
       appBar: AppBar(
         title: const Text(
-          "שליחת שיר ל-ESP32",
+          "Send to - ERCS",
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: 20),
         ),
         centerTitle: true,
@@ -843,7 +859,7 @@ class _SendSongState extends State<SendSong> {
                           SizedBox(width: 8),
                           Expanded(
                             child: Text(
-                              "בחירה והעלאת קובץ שיר",
+                              "Choose and upload song",
                               style: TextStyle(
                                 fontWeight: FontWeight.bold,
                                 fontSize: 16,
@@ -874,7 +890,7 @@ class _SendSongState extends State<SendSong> {
                                       ),
                                       SizedBox(width: 8),
                                       Text(
-                                        "טרם נבחר קובץ מוזיקה להעלאה",
+                                        "No song has choosen yet",
                                         style: TextStyle(color: Colors.black54),
                                       ),
                                     ],
@@ -903,7 +919,7 @@ class _SendSongState extends State<SendSong> {
                                       const SizedBox(width: 8),
                                       Expanded(
                                         child: Text(
-                                          "שיר נבחר: $selectedFileName",
+                                          "song has chosen: $selectedFileName",
                                           key: ValueKey(selectedFileName),
                                           style: const TextStyle(
                                             fontWeight: FontWeight.bold,
